@@ -1,71 +1,11 @@
-<?xml version="1.0" encoding="ISO-8859-1"?>
-<product productid="cfuam" active="1">
-	<title>Cloudflare UAM Automation</title>
-	<description>Automatically enables/disables Cloudflare Under Attack Mode based on online user count</description>
-	<version>3.1.0</version>
-	<url></url>
-	<versioncheckurl></versioncheckurl>
-	<dependencies></dependencies>
-	<codes>
-		<code version="*">
-			<installcode><![CDATA[
-// Create automation table
-$vbulletin->db->query_write("
-	CREATE TABLE IF NOT EXISTS " . TABLE_PREFIX . "cfuam_automation (
-		id INT(1) NOT NULL DEFAULT 1,
-		checks_run INT(10) NOT NULL DEFAULT 0,
-		last_check INT(10) NOT NULL DEFAULT 0,
-		last_users INT(10) NOT NULL DEFAULT 0,
-		uam_active TINYINT(1) NOT NULL DEFAULT 0,
-		last_high_time INT(10) NOT NULL DEFAULT 0,
-		activation_time INT(10) NOT NULL DEFAULT 0,
-		deactivation_time INT(10) NOT NULL DEFAULT 0,
-		last_action VARCHAR(500) NOT NULL DEFAULT '',
-		api_calls_made INT(10) NOT NULL DEFAULT 0,
-		last_api_result VARCHAR(255) NOT NULL DEFAULT '',
-		created_time INT(10) NOT NULL DEFAULT 0,
-		PRIMARY KEY (id)
-	) ENGINE=MyISAM
-");
+<?php
+/*======================================================================*\
+|| #################################################################### ||
+|| # Cloudflare UAM Automation Cron Job - Every 10 Minutes           # ||
+|| #################################################################### ||
+\*======================================================================*/
 
-$vbulletin->db->query_write("
-	INSERT IGNORE INTO " . TABLE_PREFIX . "cfuam_automation 
-	(id, last_check, created_time, last_action) 
-	VALUES (1, " . TIMENOW . ", " . TIMENOW . ", 'Automation installed')
-");
-
-echo "<br /><center>Cloudflare UAM Automation installed successfully!</center><br />";
-			]]></installcode>
-			<uninstallcode><![CDATA[
-$vbulletin->db->query_write("DROP TABLE IF EXISTS " . TABLE_PREFIX . "cfuam_automation");
-			]]></uninstallcode>
-		</code>
-	</codes>
-	<templates></templates>
-	<stylevardfns></stylevardfns>
-	<stylevars></stylevars>
-	<plugins>
-		<plugin active="1" executionorder="1">
-			<title>Cloudflare UAM Automation</title>
-			<hookname>admin_index_main3</hookname>
-			<phpcode><![CDATA[
-// Get current automation state
-$state = $vbulletin->db->query_first("SELECT * FROM " . TABLE_PREFIX . "cfuam_automation WHERE id = 1");
-if (!$state) {
-	$vbulletin->db->query_write("
-		INSERT INTO " . TABLE_PREFIX . "cfuam_automation 
-		(id, last_check, created_time, last_action) 
-		VALUES (1, " . TIMENOW . ", " . TIMENOW . ", 'State initialized')
-	");
-	$state = $vbulletin->db->query_first("SELECT * FROM " . TABLE_PREFIX . "cfuam_automation WHERE id = 1");
-}
-
-// Update check counter
-$vbulletin->db->query_write("
-	UPDATE " . TABLE_PREFIX . "cfuam_automation 
-	SET checks_run = checks_run + 1, last_check = " . TIMENOW . " 
-	WHERE id = 1
-");
+if (!VB_AREA) exit;
 
 // Load settings
 $enable = intval($vbulletin->options['cfuam_enable']);
@@ -74,327 +14,88 @@ $cooldown = intval($vbulletin->options['cfuam_cooldown']);
 $zone_id = trim($vbulletin->options['cfuam_zoneid']);
 $api_token = trim($vbulletin->options['cfuam_token']);
 
-// Get online user count using cookie timeout method (matches homepage)
+if (!$enable || !$zone_id || !$api_token || $threshold < 1) {
+	log_cron_action('Cloudflare UAM: Not configured', $nextitem, 1);
+	return;
+}
+
+// Get current state
+$state = $vbulletin->db->query_first("SELECT * FROM " . TABLE_PREFIX . "cfuam_automation WHERE id = 1");
+if (!$state) {
+	log_cron_action('Cloudflare UAM: State table not found', $nextitem, 1);
+	return;
+}
+
+// Update check counter
+$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET checks_run = checks_run + 1, last_check = " . TIMENOW . " WHERE id = 1");
+
+// Get current user count using cookie timeout method (matches homepage)
 $timeout_cookie = TIMENOW - $vbulletin->options['cookietimeout'];
-$online = $vbulletin->db->query_first("
-	SELECT COUNT(*) AS total 
-	FROM " . TABLE_PREFIX . "session 
-	WHERE lastactivity > " . $timeout_cookie
-);
+$online = $vbulletin->db->query_first("SELECT COUNT(*) AS total FROM " . TABLE_PREFIX . "session WHERE lastactivity > " . $timeout_cookie);
 $usercount = intval($online['total']);
 
-// Update user count
-$vbulletin->db->query_write("
-	UPDATE " . TABLE_PREFIX . "cfuam_automation 
-	SET last_users = " . $usercount . " 
-	WHERE id = 1
-");
+$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET last_users = " . $usercount . " WHERE id = 1");
 
-// Run automation if properly configured
-if ($enable && $zone_id && $api_token && $threshold > 0) {
-	$now = TIMENOW;
-	$action_message = '';
+$now = TIMENOW;
+$action_message = '';
+
+// Check threshold
+if ($usercount > $threshold) {
+	$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET last_high_time = " . $now . " WHERE id = 1");
 	
-	// Check if threshold is exceeded
-	if ($usercount > $threshold) {
-		// Record threshold breach
-		$vbulletin->db->query_write("
-			UPDATE " . TABLE_PREFIX . "cfuam_automation 
-			SET last_high_time = " . $now . " 
-			WHERE id = 1
-		");
+	if (!$state['uam_active']) {
+		// Enable UAM
+		$ch = curl_init();
+		curl_setopt($ch, CURLOPT_URL, "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level");
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+		curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
+		curl_setopt($ch, CURLOPT_POSTFIELDS, '{"value":"under_attack"}');
+		curl_setopt($ch, CURLOPT_HTTPHEADER, array("Authorization: Bearer $api_token", "Content-Type: application/json"));
 		
-		// Enable UAM if not already active
-		if (!$state['uam_active']) {
-			// Make Cloudflare API call to enable UAM
-			$ch = curl_init();
-			curl_setopt($ch, CURLOPT_URL, "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level");
-			curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-			curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-			curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-			curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
-			curl_setopt($ch, CURLOPT_POSTFIELDS, '{"value":"under_attack"}');
-			curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-				"Authorization: Bearer $api_token",
-				"Content-Type: application/json"
-			));
-			
-			$result = curl_exec($ch);
-			$error = curl_error($ch);
-			$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-			curl_close($ch);
-			
-			// Process API response
-			if ($error) {
-				$action_message = 'UAM Enable FAILED - ' . $error;
-				$api_result = 'Error: ' . $error;
-			} elseif ($http_code == 200) {
-				$response = json_decode($result, true);
-				if (!empty($response['success'])) {
-					$action_message = 'UAM ENABLED - Users: ' . $usercount . ' > ' . $threshold;
-					$api_result = 'Success - UAM activated';
-					
-					// Update database - UAM is now active
-					$vbulletin->db->query_write("
-						UPDATE " . TABLE_PREFIX . "cfuam_automation 
-						SET uam_active = 1, activation_time = " . $now . " 
-						WHERE id = 1
-					");
-				} else {
-					$action_message = 'UAM Enable FAILED - API returned error';
-					$api_result = 'API Error: ' . (isset($response['errors'][0]['message']) ? $response['errors'][0]['message'] : 'Unknown');
-				}
-			} else {
-				$action_message = 'UAM Enable FAILED - HTTP ' . $http_code;
-				$api_result = 'HTTP Error: ' . $http_code;
-			}
-			
-			// Update action log and API result
-			$vbulletin->db->query_write("
-				UPDATE " . TABLE_PREFIX . "cfuam_automation 
-				SET last_action = '" . $vbulletin->db->escape_string($action_message) . "',
-					last_api_result = '" . $vbulletin->db->escape_string($api_result) . "',
-					api_calls_made = api_calls_made + 1
-				WHERE id = 1
-			");
-		}
-	} else {
-		// Below threshold - check if we should disable UAM
-		if ($state['uam_active'] && $state['last_high_time'] > 0) {
-			$minutes_since_high = floor(($now - $state['last_high_time']) / 60);
-			
-			if ($minutes_since_high >= $cooldown) {
-				// Make Cloudflare API call to disable UAM
-				$ch = curl_init();
-				curl_setopt($ch, CURLOPT_URL, "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level");
-				curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-				curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-				curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-				curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
-				curl_setopt($ch, CURLOPT_POSTFIELDS, '{"value":"high"}');
-				curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-					"Authorization: Bearer $api_token",
-					"Content-Type: application/json"
-				));
-				
-				$result = curl_exec($ch);
-				$error = curl_error($ch);
-				$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-				curl_close($ch);
-				
-				// Process API response
-				if ($error) {
-					$action_message = 'UAM Disable FAILED - ' . $error;
-					$api_result = 'Error: ' . $error;
-				} elseif ($http_code == 200) {
-					$response = json_decode($result, true);
-					if (!empty($response['success'])) {
-						$action_message = 'UAM DISABLED - Cooldown: ' . $cooldown . ' min';
-						$api_result = 'Success - UAM deactivated';
-						
-						// Update database - UAM is now inactive
-						$vbulletin->db->query_write("
-							UPDATE " . TABLE_PREFIX . "cfuam_automation 
-							SET uam_active = 0, deactivation_time = " . $now . " 
-							WHERE id = 1
-						");
-					} else {
-						$action_message = 'UAM Disable FAILED - API returned error';
-						$api_result = 'API Error: ' . (isset($response['errors'][0]['message']) ? $response['errors'][0]['message'] : 'Unknown');
-					}
-				} else {
-					$action_message = 'UAM Disable FAILED - HTTP ' . $http_code;
-					$api_result = 'HTTP Error: ' . $http_code;
-				}
-				
-				// Update action log and API result
-				$vbulletin->db->query_write("
-					UPDATE " . TABLE_PREFIX . "cfuam_automation 
-					SET last_action = '" . $vbulletin->db->escape_string($action_message) . "',
-						last_api_result = '" . $vbulletin->db->escape_string($api_result) . "',
-						api_calls_made = api_calls_made + 1
-					WHERE id = 1
-				");
+		$result = curl_exec($ch);
+		$error = curl_error($ch);
+		$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+		
+		if (!$error && $http_code == 200) {
+			$response = json_decode($result, true);
+			if (!empty($response['success'])) {
+				$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET uam_active = 1, activation_time = " . $now . ", api_calls_made = api_calls_made + 1 WHERE id = 1");
+				$action_message = 'UAM ENABLED - Users: ' . $usercount . ' > ' . $threshold;
 			}
 		}
 	}
-}
-
-// Get updated state for display
-$state = $vbulletin->db->query_first("SELECT * FROM " . TABLE_PREFIX . "cfuam_automation WHERE id = 1");
-
-// === DISPLAY STATUS ===
-print_table_start();
-print_table_header('Cloudflare UAM Automation');
-
-$status_content = '';
-
-// Configuration check
-if (empty($zone_id) || empty($api_token)) {
-	$status_content .= '<div style="color: #AA0000; font-weight: bold; font-size: 14px;">Configuration Required</div>';
-	$status_content .= '<div style="margin-top: 5px; font-size: 11px;">Please configure your Cloudflare Zone ID and API Token in the settings below.</div>';
 } else {
-	// Get current Cloudflare status
-	$ch = curl_init();
-	curl_setopt($ch, CURLOPT_URL, "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level");
-	curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-	curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-	curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
-	curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-		"Authorization: Bearer $api_token",
-		"Content-Type: application/json"
-	));
-	
-	$result = curl_exec($ch);
-	$error = curl_error($ch);
-	$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-	curl_close($ch);
-	
-	if ($error) {
-		$status_content .= '<div style="color: #AA0000; font-weight: bold;">Connection Error: ' . htmlspecialchars($error) . '</div>';
-	} elseif ($http_code != 200) {
-		$status_content .= '<div style="color: #AA0000; font-weight: bold;">API Error (HTTP ' . $http_code . ')</div>';
-		if ($http_code == 401) {
-			$status_content .= '<div style="color: #666; font-size: 11px;">Check your API token</div>';
-		} elseif ($http_code == 404) {
-			$status_content .= '<div style="color: #666; font-size: 11px;">Check your Zone ID</div>';
-		}
-	} else {
-		$response = json_decode($result, true);
-		if (!empty($response['success'])) {
-			$security_level = $response['result']['value'];
-			if ($security_level == 'under_attack') {
-				$status_content .= '<div style="color: #AA0000; font-weight: bold; font-size: 14px;">Under Attack Mode ACTIVE</div>';
-			} else {
-				$status_content .= '<div style="color: #008800; font-weight: bold; font-size: 14px;">Under Attack Mode OFF</div>';
-				$status_content .= '<div style="color: #666;">Current level: ' . ucfirst(str_replace('_', ' ', $security_level)) . '</div>';
+	// Check cooldown
+	if ($state['uam_active'] && $state['last_high_time'] > 0 && ($now - $state['last_high_time'] >= $cooldown * 60)) {
+		// Disable UAM
+		$ch = curl_init();
+		curl_setopt($ch, CURLOPT_URL, "https://api.cloudflare.com/client/v4/zones/$zone_id/settings/security_level");
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+		curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+		curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PATCH');
+		curl_setopt($ch, CURLOPT_POSTFIELDS, '{"value":"high"}');
+		curl_setopt($ch, CURLOPT_HTTPHEADER, array("Authorization: Bearer $api_token", "Content-Type: application/json"));
+		
+		$result = curl_exec($ch);
+		$error = curl_error($ch);
+		$http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		curl_close($ch);
+		
+		if (!$error && $http_code == 200) {
+			$response = json_decode($result, true);
+			if (!empty($response['success'])) {
+				$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET uam_active = 0, deactivation_time = " . $now . ", api_calls_made = api_calls_made + 1 WHERE id = 1");
+				$action_message = 'UAM DISABLED - Cooldown expired';
 			}
-		} else {
-			$status_content .= '<div style="color: #AA0000; font-weight: bold;">API Response Error</div>';
 		}
 	}
 }
 
-// Automation status
-$status_content .= '<div style="margin-top: 15px;">';
-$auto_color = $enable ? '#008800' : '#AA0000';
-$status_content .= '<strong>Automation:</strong> <span style="color: ' . $auto_color . '; font-weight: bold;">' . ($enable ? 'ENABLED' : 'DISABLED') . '</span>';
-$status_content .= '</div>';
-
-// User count status (now matches homepage exactly)
-$user_color = ($enable && $usercount > $threshold) ? '#AA0000' : '#333333';
-$status_content .= '<div style="margin-top: 8px;">';
-$status_content .= '<strong>Online Users (matches homepage):</strong> <span style="color: ' . $user_color . ';">' . number_format($usercount) . ' / ' . number_format($threshold) . '</span>';
-if ($enable && $usercount > $threshold) {
-	$status_content .= ' <span style="color: #AA0000; font-weight: bold;">(THRESHOLD EXCEEDED)</span>';
-}
-$status_content .= '</div>';
-
-// UAM Internal State
-$status_content .= '<div style="margin-top: 8px;">';
-$uam_color = $state['uam_active'] ? '#AA0000' : '#008800';
-$status_content .= '<strong>UAM Internal State:</strong> <span style="color: ' . $uam_color . '; font-weight: bold;">' . ($state['uam_active'] ? 'ACTIVE' : 'INACTIVE') . '</span>';
-$status_content .= '</div>';
-
-// Cooldown status
-if ($state['uam_active'] && $state['last_high_time'] > 0 && $usercount <= $threshold) {
-	$minutes_since_high = floor((TIMENOW - $state['last_high_time']) / 60);
-	$cooldown_remaining = max(0, $cooldown - $minutes_since_high);
-	if ($cooldown_remaining > 0) {
-		$status_content .= '<div style="margin-top: 8px; color: #AA6600; font-weight: bold;">';
-		$status_content .= 'Cooldown: ' . $cooldown_remaining . ' minutes remaining';
-		$status_content .= '</div>';
-	} else {
-		$status_content .= '<div style="margin-top: 8px; color: #008800;">';
-		$status_content .= 'Cooldown expired - UAM will be disabled on next check';
-		$status_content .= '</div>';
-	}
+if ($action_message) {
+	$vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET last_action = '" . $vbulletin->db->escape_string($action_message) . "' WHERE id = 1");
 }
 
-// Statistics
-$status_content .= '<div style="margin-top: 15px; padding: 8px; background: #f9f9f9; border: 1px solid #ddd;">';
-$status_content .= '<strong>Statistics:</strong><br />';
-$status_content .= 'Automation checks: ' . number_format($state['checks_run']) . '<br />';
-$status_content .= 'API calls made: ' . number_format($state['api_calls_made']) . '<br />';
-$status_content .= 'Last check: ' . date('Y-m-d H:i:s', $state['last_check']) . '<br />';
-$status_content .= 'Cookie timeout setting: ' . round($vbulletin->options['cookietimeout']/60) . ' minutes<br />';
-
-if (!empty($state['last_action'])) {
-	$status_content .= 'Last action: ' . htmlspecialchars($state['last_action']) . '<br />';
-}
-
-if ($state['last_high_time'] > 0) {
-	$status_content .= 'Last threshold breach: ' . date('Y-m-d H:i:s', $state['last_high_time']) . '<br />';
-}
-
-if (!empty($state['last_api_result'])) {
-	$status_content .= 'Last API result: ' . htmlspecialchars($state['last_api_result']) . '<br />';
-}
-
-$status_content .= '</div>';
-
-// Settings link
-$status_content .= '<div style="text-align: right; margin-top: 10px;">';
-$status_content .= '<a href="options.php?do=options&amp;dogroup=cfuam_settings" style="font-size: 11px;">Configure Settings</a>';
-$status_content .= '</div>';
-
-print_label_row('Status', $status_content, '', 'top', NULL, false);
-print_table_footer(2, '', '', false);
-			]]></phpcode>
-		</plugin>
-	</plugins>
-	<phrases>
-		<phrasetype name="vbulletinsettings" fieldname="vbsettings">
-			<phrase name="settinggroup_cfuam_settings" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Cloudflare UAM Automation]]></phrase>
-			<phrase name="setting_cfuam_enable_title" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Enable Cloudflare UAM Automation?]]></phrase>
-			<phrase name="setting_cfuam_enable_desc" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Turn Cloudflare Under Attack Mode automation on or off.]]></phrase>
-			<phrase name="setting_cfuam_threshold_title" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[User Threshold to Enable UAM]]></phrase>
-			<phrase name="setting_cfuam_threshold_desc" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Enable Under Attack Mode if online user count exceeds this value.]]></phrase>
-			<phrase name="setting_cfuam_cooldown_title" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Minutes Below Threshold to Disable UAM]]></phrase>
-			<phrase name="setting_cfuam_cooldown_desc" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Disable Under Attack Mode if online user count stays below the threshold for this many minutes.]]></phrase>
-			<phrase name="setting_cfuam_zoneid_title" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Cloudflare Zone ID]]></phrase>
-			<phrase name="setting_cfuam_zoneid_desc" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Enter your Cloudflare Zone ID for your website.]]></phrase>
-			<phrase name="setting_cfuam_token_title" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Cloudflare API Token]]></phrase>
-			<phrase name="setting_cfuam_token_desc" date="2025-06-13" username="z3r010" version="3.1.0"><![CDATA[Enter your Cloudflare API Token (must have Zone &gt; Settings &gt; Edit permission for your domain).]]></phrase>
-		</phrasetype>
-	</phrases>
-	<options>
-		<settinggroup name="cfuam_settings" displayorder="65535">
-			<setting varname="cfuam_enable" displayorder="5">
-				<datatype>integer</datatype>
-				<optioncode>yesno</optioncode>
-				<defaultvalue>1</defaultvalue>
-			</setting>
-			<setting varname="cfuam_threshold" displayorder="10">
-				<datatype>number</datatype>
-				<defaultvalue>15000</defaultvalue>
-			</setting>
-			<setting varname="cfuam_cooldown" displayorder="15">
-				<datatype>number</datatype>
-				<defaultvalue>10</defaultvalue>
-			</setting>
-			<setting varname="cfuam_zoneid" displayorder="20">
-				<datatype>free</datatype>
-				<defaultvalue></defaultvalue>
-			</setting>
-			<setting varname="cfuam_token" displayorder="25">
-				<datatype>free</datatype>
-				<defaultvalue></defaultvalue>
-			</setting>
-		</settinggroup>
-	</options>
-	<helptopics></helptopics>
-	<cronentries>
-		<cron varname="cfuam_cron" active="1" loglevel="1">
-			<filename>./includes/cron/cfuam.php</filename>
-			<scheduling>
-				<weekday>-1</weekday>
-				<day>-1</day>
-				<hour>-1</hour>
-				<minute>0,5,10,15,20,25,30,35,40,45,50,55</minute>
-			</scheduling>
-		</cron>
-	</cronentries>
-	<faqentries></faqentries>
-	<navigation></navigation>
-</product>
+log_cron_action('Cloudflare UAM: Users=' . $usercount . '/' . $threshold . ($action_message ? ' - ' . $action_message : ''), $nextitem, 1);
+?>
