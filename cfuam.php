@@ -1,7 +1,7 @@
 <?php
 /*======================================================================*\
 || #################################################################### ||
-|| # Cloudflare UAM Automation Cron Job                              # ||
+|| # Cloudflare UAM Automation Cron Job - Every 10 Minutes           # ||
 || #################################################################### ||
 \*======================================================================*/
 
@@ -29,8 +29,9 @@ if (!$state) {
 // Update check counter
 $vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET checks_run = checks_run + 1, last_check = " . TIMENOW . " WHERE id = 1");
 
-// Get current user count
-$online = $vbulletin->db->query_first("SELECT COUNT(*) AS total FROM " . TABLE_PREFIX . "session WHERE lastactivity > " . (TIMENOW - 900));
+// Get current user count using cookie timeout method (matches homepage)
+$timeout_cookie = TIMENOW - $vbulletin->options['cookietimeout'];
+$online = $vbulletin->db->query_first("SELECT COUNT(*) AS total FROM " . TABLE_PREFIX . "session WHERE lastactivity > " . $timeout_cookie);
 $usercount = intval($online['total']);
 
 $vbulletin->db->query_write("UPDATE " . TABLE_PREFIX . "cfuam_automation SET last_users = " . $usercount . " WHERE id = 1");
